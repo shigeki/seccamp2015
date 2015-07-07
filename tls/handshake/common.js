@@ -1,11 +1,25 @@
 var assert = require('assert');
 
+exports.initial_version = new Buffer('0303', 'hex'); // TLS1.2
+exports.initial_cipher = new Buffer('009C', 'hex');  // TLS_RSA_WITH_AES_128_GCM_SHA256
+
+function Rev(obj) {
+  var ret = {};
+  for(var key in obj) {
+    var value = obj[key];
+    ret[value] = key;
+  }
+  return ret;
+};
+
 exports.ContentType = {
   ChangeCipherSpec: 20,
   Alert: 21,
   Handshake: 22,
   ApplicationData: 23
 };
+
+exports.RevContentType = Rev(exports.ContentType);
 
 exports.HandshakeType = {
   HelloRequest: 0,
@@ -19,6 +33,8 @@ exports.HandshakeType = {
   ClientKeyExchange: 16,
   Finished: 20
 };
+
+exports.RevHandshakeType = Rev(exports.RevHandshakeType);
 
 exports.ExtensionType = {
   ServerName: 0,
@@ -49,6 +65,8 @@ exports.ExtensionType = {
   RenegotiationInfo: 65281
 };
 
+exports.RevExtensionType = Rev(exports.ExtensionType);
+
 exports.IntegerToBytes = IntegerToBytes;
 function IntegerToBytes(n) {
   assert.strictEqual(typeof n, 'number');
@@ -61,11 +79,11 @@ exports.getVectorSize = function(v, ceil) {
 };
 
 exports.incSeq = function incSeq(buf) {
-  for (var i = 7; i >= 0; i--) {
-    if (buf[i] < 255) {
+  for (var i = buf.length - 1; i >= 0; i--) {
+    if (buf[i] < 0xff) {
       buf[i]++;
       break;
     }
-    buf[i] = 0;
+    buf[i] = 0x00;
   }
 };

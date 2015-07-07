@@ -18,7 +18,7 @@ DataWriter.prototype.take = function() {
   return rv;
 };
 
-DataWriter.prototype.WriteBytes = function(data, data_len) {
+DataWriter.prototype.writeBytes = function(data, data_len) {
   var dest = BeginWrite.call(this, data_len);
 
   if (dest === null) {
@@ -36,12 +36,12 @@ DataWriter.prototype.WriteBytes = function(data, data_len) {
   return true;
 };
 
-DataWriter.prototype.WriteVector = function(data, data_len, ceil) {
+DataWriter.prototype.writeVector = function(data, data_len, ceil) {
   var size = IntegerToBytes(ceil);
-  if (!this.WriteBytes(data_len, size))
+  if (!this.writeBytes(data_len, size))
     return false;
 
-  if (!this.WriteBytes(data, data_len))
+  if (!this.writeBytes(data, data_len))
     return false;
 
   return true;

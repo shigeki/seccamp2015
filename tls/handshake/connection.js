@@ -3,6 +3,7 @@ var util = require('util');
 var debug = util.debuglog('seccam');
 var crypto = require('crypto');
 var constants = require('constants');
+var Transform = require('stream').Transform;
 var EventEmitter = require('events').EventEmitter;
 var DataReader = require('./data_reader.js').DataReader;
 var DataWriter = require('./data_writer.js').DataWriter;
@@ -14,10 +15,11 @@ var getVectorSize = common.getVectorSize;
 var initial_version = common.initial_version;
 var initial_cipher = common.initial_cipher;
 var incSeq = common.incSeq;
+var fromPEM = common.fromPEM;
 
 exports.TLSConnection = TLSConnection;
 function TLSConnection(opts, is_server) {
-  EventEmitter.call(this);
+  Transform.call(this);
   this.socket = opts.socket;
   this.cert = opts.cert;
   this.ca = opts.ca;
@@ -58,9 +60,9 @@ function TLSConnection(opts, is_server) {
     this.sendFinished();
   });
 }
-util.inherits(TLSConnection, EventEmitter);
+util.inherits(TLSConnection, Transform);
 
-TLSConnection.prototype.processPacket = function processPacket(reader) {
+TLSConnection.prototype.processPacket = function (reader) {
   var state = this.state;
   var frame = new TLSFrame(this);
   assert(reader.bytesRemaining() > 5);
@@ -98,8 +100,15 @@ TLSConnection.prototype.processPacket = function processPacket(reader) {
     this.emit('error', err);
   }
 
-  if (reader.bytesRemaining() > 0)
+  if (reader.bytesRemaining() > 0) {
     this.processPacket(reader);
+  }
+};
+
+TLSConnection.prototype._transform = function processPacket(chunk, encoding, cb) {
+  var reader = new DataReader(chunk);
+  this.processPacket(reader);
+  cb();
 };
 
 TLSConnection.prototype.decrypt = function(frame, buf) {
@@ -257,7 +266,7 @@ TLSConnection.prototype.sendServerHello = function() {
 
 TLSConnection.prototype.sendServerCertificate = function() {
   var server_certificate_opts = {
-    certificate_list: [this.cert, this.ca]
+    certificate_list: [fromPEM(this.cert), fromPEM(this.ca)]
   };
   var frame = new TLSFrame(this);
   var buf = frame.createCertificate(frame, true, server_certificate_opts);

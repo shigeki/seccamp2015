@@ -87,3 +87,13 @@ exports.incSeq = function incSeq(buf) {
     buf[i] = 0x00;
   }
 };
+
+exports.fromPEM = fromPEM;
+function fromPEM(data) {
+  var text = data.toString().split(/(\r\n|\r|\n)+/g);
+  text = text.filter(function(line) {
+    return line.trim().length !== 0;
+  });
+  text = text.slice(1, -1).join('');
+  return new Buffer(text.replace(/[^\w\d\+\/=]+/g, ''), 'base64');
+};

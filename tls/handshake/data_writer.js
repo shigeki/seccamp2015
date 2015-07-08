@@ -19,9 +19,11 @@ DataWriter.prototype.take = function() {
 };
 
 DataWriter.prototype.writeBytes = function(data, data_len) {
+  assert.strictEqual(typeof data_len, 'number');
   var dest = BeginWrite.call(this, data_len);
 
   if (dest === null) {
+    throw new Error('Cannot writeBytes');
     return false;
   }
 

@@ -14,6 +14,7 @@ var ExtensionType = common.ExtensionType;
 var getVectorSize = common.getVectorSize;
 var initial_version = common.initial_version;
 var initial_cipher = common.initial_cipher;
+var ecdhe_cipher = common.ecdhe_cipher;
 var incSeq = common.incSeq;
 var fromPEM = common.fromPEM;
 
@@ -247,13 +248,15 @@ TLSConnection.prototype.sendHandshake = function(buf, cb) {
 
 TLSConnection.prototype.sendServerHello = function() {
   var client_hello = this.state.client_hello;
-  var cipher_suite = initial_cipher;
+//  var cipher_suite = initial_cipher;
+  var cipher_suite = ecdhe_cipher;
   var server_hello_opts = {
     server_version: initial_version,
     random: crypto.randomBytes(32),
     session_id: new Buffer(0),
     cipher_suites: cipher_suite,
-    compression_methods: (new Buffer(1)).fill(0)
+    compression_methods: (new Buffer(1)).fill(0),
+    extensions: [ExtensionType.EcPointFormats]
   };
   this.state.server_hello = server_hello_opts;
   var frame = new TLSFrame(this);
@@ -265,6 +268,8 @@ TLSConnection.prototype.sendServerHello = function() {
 };
 
 TLSConnection.prototype.sendServerCertificate = function() {
+  var self = this;
+  var state = this.state;
   var server_certificate_opts = {
     certificate_list: [fromPEM(this.cert), fromPEM(this.ca)]
   };
@@ -272,9 +277,24 @@ TLSConnection.prototype.sendServerCertificate = function() {
   var buf = frame.createCertificate(frame, true, server_certificate_opts);
   this.sendHandshake(buf, function() {
     debug('ServerCertificate sent');
+    if (state.server_hello.cipher_suites === ecdhe_cipher) {
+      self.sendServerKeyExchange();
+    } else {
+      self.sendServerHelloDone();
+    }
+  });
+};
+
+TLSConnection.prototype.sendServerKeyExchange = function() {
+  var self = this;
+  var frame = new TLSFrame(this);
+  var buf = frame.createServerKeyExchange(frame);
+  this.sendHandshake(buf, function() {
+    debug('ServerKeyExchange sent');
     this.sendServerHelloDone();
   });
 };
+
 
 TLSConnection.prototype.sendServerHelloDone = function() {
   var frame = new TLSFrame(this);
@@ -405,10 +425,20 @@ TLSFrame.prototype.processHelloExtension = function(reader) {
 };
 
 TLSFrame.prototype.processClientKeyExchange = function(reader) {
-  var size = (reader.readBytes(2)).readUInt16BE(0);
-  var encryptedPreMasterSecret = reader.readBytes(size);
-  var preMasterSecret = crypto.privateDecrypt({key:this.connection.key, padding: constants.RSA_PKCS1_PADDING}, encryptedPreMasterSecret);
-  assert.strictEqual(preMasterSecret.length, 48);
+  var preMasterSecret;
+  var connection = this.connection;
+  var state = connection.state;
+  if (state.server_hello.cipher_suites === ecdhe_cipher) {
+    var len = (reader.readBytes(1)).readUInt8(0);
+    var peer_public_key = reader.readBytes(len);
+    preMasterSecret = state.ServerECDHE.computeSecret(peer_public_key);
+  } else {
+    var size = (reader.readBytes(2)).readUInt16BE(0);
+    var buf = reader.readBytes(size);
+    var encryptedPreMasterSecret = buf;
+    preMasterSecret = crypto.privateDecrypt({key:connection.key, padding: constants.RSA_PKCS1_PADDING}, encryptedPreMasterSecret);
+    assert.strictEqual(preMasterSecret.length, 48);
+  }
   this.connection.state.pre_master_secret = preMasterSecret;
 };
 
@@ -443,18 +473,19 @@ TLSFrame.prototype.processFinished = function(reader, finished_buf) {
 
 TLSFrame.prototype.createHello = function(frame, is_server, opts) {
   var type = is_server ? HandshakeType.ServerHello: HandshakeType.ClientHello ;
-  var size = getHelloSize(opts, type);
-  var writer = new DataWriter(size + 4);
+  var ext = this.createHelloExtension(opts.extensions);
+  var size = getHelloSize(opts, type) + ext.length;
+  var writer = new DataWriter(size + 4); // add type, length
   var version = is_server ? opts.server_version: opts.client_version;
   writer.writeBytes(HandshakeType.ServerHello, 1);
   writer.writeBytes(size, 3);
-  writer.writeBytes(version, 2);
-  writer.writeBytes(opts.random, 32);
+  writer.writeBytes(version, version.length);
+  writer.writeBytes(opts.random, opts.random.length);
   writer.writeVector(opts.session_id, opts.session_id.length, 32);
   if (type === HandshakeType.ServerHello) {
     // Send ServerHello
     writer.writeBytes(opts.cipher_suites, opts.cipher_suites.length);
-    writer.writeBytes(opts.compression_methods, opts.compression_methods);
+    writer.writeBytes(opts.compression_methods, opts.compression_methods.length);
   } else {
     // Send ClientHello
     var buf = Buffer.concat(opts.cipher_suites);
@@ -462,11 +493,35 @@ TLSFrame.prototype.createHello = function(frame, is_server, opts) {
     writer.writeVector(opts.compression_methods, opts.compression_methods.length, Math.pow(2,8) - 2);
   }
 
+  if (opts.extensions.length) {
+    writer.writeBytes(ext, ext.length);
+  }
 
-  if (opts.extensions)
-    writer.writeVector(opts.extensions, opts.extensions.length, Math.pow(2,16) - 2);
+  var ret = this.createRecordHeader(ContentType.Handshake, writer.take());
+  return ret;
+};
 
-  return this.createRecordHeader(ContentType.Handshake, writer.take());
+TLSFrame.prototype.createHelloExtension = function(ext_types) {
+  assert(Array.isArray(ext_types));
+  var extlength_buf = new Buffer(2);
+  var extlength = 0;
+  var buflist = [];
+  for(var i = 0; i < ext_types.length; i++) {
+    var ext_type = ext_types[i];
+    var buf;
+    switch(ext_type) {
+    case ExtensionType.EcPointFormats:
+      buf = new Buffer('000b00020100', 'hex'); // ec_point_formats(11) uncompressed(0)
+      break;
+    default:
+      throw new Error('Unknown Supported ExtensionType:' + ext_type);
+    }
+    buflist.push(buf);
+    extlength += buf.length;
+  }
+  extlength_buf.writeUInt16BE(extlength, 0);
+  buflist.unshift(extlength_buf);
+  return Buffer.concat(buflist);
 };
 
 TLSFrame.prototype.createCertificate = function(frame, is_server, opts) {
@@ -487,6 +542,32 @@ TLSFrame.prototype.createCertificate = function(frame, is_server, opts) {
   }
   var b = writer.take();
   return this.createRecordHeader(ContentType.Handshake, b);
+};
+
+TLSFrame.prototype.createServerKeyExchange = function(frame) {
+  var connection = this.connection;
+  var state = connection.state;
+  var type = HandshakeType.ServerKeyExchange;
+  var writer = new DataWriter(4);
+  writer.writeBytes(type, 1);
+  var curve_type = new Buffer('03', 'hex');    // named_curve
+  var named_curve = new Buffer('0017', 'hex'); // prime256v1
+  state.ServerECDHE = crypto.createECDH('prime256v1');
+  state.ServerECDHE.generateKeys();
+  var public_key = state.ServerECDHE.getPublicKey();
+  var public_key_length = new Buffer(1);
+  public_key_length.writeUInt8(public_key.length, 0);
+  var ECParameters = Buffer.concat([curve_type, named_curve]);
+  var ECPoint =Buffer.concat([public_key_length, public_key]);
+  var ServerECDHParams = Buffer.concat([ECParameters, ECPoint]);
+  var signature_hash_algo = new Buffer('0601', 'hex'); // SHA512-RSA
+  var buf = Buffer.concat([state.client_hello.random, state.server_hello.random, ServerECDHParams]);
+  var sign = crypto.createSign('RSA-SHA512');
+  sign.update(buf);
+  var signature = Buffer.concat([new Buffer('0100', 'hex'), sign.sign(connection.key)]);
+  var buf2 = Buffer.concat([ServerECDHParams, signature_hash_algo, signature]);
+  writer.writeBytes(buf2.length, 3);
+  return this.createRecordHeader(ContentType.Handshake, Buffer.concat([writer.take(), buf2]));
 };
 
 TLSFrame.prototype.createServerHelloDone = function(frame) {
@@ -537,6 +618,10 @@ function TLSState() {
   this.pre_master_secret = null;
   this.sendFinished = false;
   this.recvFinished = false;
+  this.serverECDHE = null;
+  this.serverPublicKey = null;
+  this.clientECDHE = null;
+  this.clientPublicKey = null;
   this.securityParameters = {
     entity: null,
     prf_algorithm: 'sha256',
@@ -573,9 +658,6 @@ function getHelloSize(opts, type) {
     size += getVectorSize(Buffer.concat(opts.cipher_suites), Math.pow(2, 16) - 2);
     size += getVectorSize(opts.compression_methods, Math.pow(2, 8) - 1);
   }
-
-  if (opts.extensions)
-    size += getVectorSize(opts.extensions, Math.pow(2, 16) - 1);
 
   return size;
 }

@@ -145,9 +145,19 @@ function fromPEM(data) {
 };
 
 exports.toPEM = toPEM;
-function toPEM(data) {
-var begin = '-----BEGIN PUBLIC KEY-----\n';
-var end = '-----END PUBLIC KEY-----\n';
+function toPEM(data, type) {
+  var begin;
+  var end;
+  switch(type) {
+    case 'public_key':
+    begin = '-----BEGIN PUBLIC KEY-----\n';
+    end = '-----END PUBLIC KEY-----\n';
+    break;
+    case 'certificate':
+    begin = '-----BEGIN CERTIFICATE-----\n';
+    end = '-----END CERTIFICATE-----\n';
+    break;
+  }
   var encode = data.toString('base64');
   var ret = '';
   for(var i = 0; i < encode.length; i += 64) {

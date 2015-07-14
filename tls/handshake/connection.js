@@ -20,6 +20,7 @@ var incSeq = common.incSeq;
 var fromPEM = common.fromPEM;
 var RevAlertLevel = common.RevAlertLevel;
 var RevAlertDescription = common.RevAlertDescription;
+var supported_cipher_list = [ecdhe_cipher, initial_cipher];
 
 exports.TLSConnection = TLSConnection;
 function TLSConnection(opts, is_server) {
@@ -27,6 +28,7 @@ function TLSConnection(opts, is_server) {
   this.cert = opts.cert;
   this.ca = opts.ca;
   this.key = opts.key;
+  this.pubkey = null;
   this.is_server = is_server;
   this.version = initial_version;
   this.state = new TLSState();
@@ -277,8 +279,9 @@ TLSConnection.prototype.sendClientHello = function() {
     client_version: initial_version,
     random: crypto.randomBytes(32),
     session_id: new Buffer(0),
-    cipher_suites: [initial_cipher],
-    compression_methods: new Buffer('00', 'hex')
+    cipher_suites: supported_cipher_list,
+    compression_methods: new Buffer('00', 'hex'),
+    extensions: [ExtensionType.SupportedGroups, ExtensionType.EcPointFormats, ExtensionType.SignatureAlgorithms]
   };
   this.state.client_hello = client_hello_opts;
   var frame = new TLSFrame(this);
@@ -289,9 +292,9 @@ TLSConnection.prototype.sendClientHello = function() {
 };
 
 TLSConnection.prototype.sendServerHello = function() {
-  var client_hello = this.state.client_hello;
-//  var cipher_suite = initial_cipher;
-  var cipher_suite = ecdhe_cipher;
+  var state = this.state;
+  var client_hello = state.client_hello;
+  var cipher_suite = SelectCipher(client_hello.cipher_suites);
   var server_hello_opts = {
     server_version: initial_version,
     random: crypto.randomBytes(32),
@@ -319,7 +322,7 @@ TLSConnection.prototype.sendServerCertificate = function() {
   var buf = frame.createCertificate(frame, true, server_certificate_opts);
   this.sendHandshake(buf, function() {
     debug('ServerCertificate sent');
-    if (state.server_hello.cipher_suites === ecdhe_cipher) {
+    if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
       self.sendServerKeyExchange();
     } else {
       self.sendServerHelloDone();
@@ -483,10 +486,10 @@ TLSFrame.prototype.processClientKeyExchange = function(reader) {
   var preMasterSecret;
   var connection = this.connection;
   var state = connection.state;
-  if (state.server_hello.cipher_suites === ecdhe_cipher) {
+  if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
     var len = (reader.readBytes(1)).readUInt8(0);
-    var peer_public_key = reader.readBytes(len);
-    preMasterSecret = state.ServerECDHE.computeSecret(peer_public_key);
+    state.clientPublicKey = reader.readBytes(len);
+    preMasterSecret = state.ServerECDHE.computeSecret(state.clientPublicKey);
   } else {
     var size = (reader.readBytes(2)).readUInt16BE(0);
     var buf = reader.readBytes(size);
@@ -506,19 +509,47 @@ TLSFrame.prototype.processCertificate = function(reader, is_server) {
   var certlist_reader = new DataReader(certificate_list);
   while(certlist_reader.bytesRemaining() > 0) {
     var cert = certlist_reader.readVector(0, Math.pow(2, 24) - 1);
-    try {
-    var res = rfc3280.Certificate.decode(cert, 'der');
-    } catch(e) {
-      throw new Error('Certificate parse Error:', cert);
-    }
-    var tbs = res.tbsCertificate;
-    cert_list.push(tbs);
+    cert_list.push(cert);
   }
+
+  try {
+    var res = rfc3280.Certificate.decode(state.cert_list[0], 'der');
+  } catch(e) {
+    throw new Error('Certificate parse Error:', cert);
+  }
+  var server_cert = res.tbsCertificate;
+  var SubjectPublicKeyInfo = rfc3280.SubjectPublicKeyInfo;
+  var spk = SubjectPublicKeyInfo.encode(server_cert.subjectPublicKeyInfo, 'der');
+  connection.pubkey = common.toPEM(spk, 'public_key');
   connection.emit('Certificate');
 };
 
 TLSFrame.prototype.processServerKeyExchange = function(reader, is_server) {
   var connection = this.connection;
+  var state = connection.state;
+  if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
+    var curve_type = reader.readBytes(1);
+    assert(curve_type.readUInt8(0) === 03); // only named curve supported
+    var named_curve = reader.readBytes(2);
+    assert(named_curve.readUInt16BE(0) === 23); // only secp256r1 supported
+    state.serverPublicKey = reader.readVector(0, Math.pow(2, 8) - 1);
+    var signature_hash_algo = reader.readBytes(2);
+    assert(signature_hash_algo.equals(new Buffer('0401', 'hex'))); // only RSA-SHA256 supported
+    var signature_length = (reader.readBytes(2)).readUInt16BE(0);
+    var signature = reader.readBytes(signature_length);
+    var verify = crypto.createVerify('RSA-SHA256');
+    var ECParameters = Buffer.concat([curve_type, named_curve]);
+    var public_key_length = new Buffer(1);
+    public_key_length.writeUInt8(state.serverPublicKey.length, 0);
+    var ECPoint =Buffer.concat([public_key_length, state.serverPublicKey]);
+    var ServerECDHParams = Buffer.concat([ECParameters, ECPoint]);
+    var buf = Buffer.concat([state.client_hello.random, state.server_hello.random, ServerECDHParams]);
+    verify.update(buf);
+    var server_cert = common.toPEM(state.cert_list[0], 'certificate');
+    var r = verify.verify(server_cert, signature);
+    assert(r); // Check Signature Verification
+    debug('ServerECDHParams verified');
+  }
   connection.emit('ServerKeyExchange');
 };
 
@@ -604,7 +635,10 @@ TLSFrame.prototype.createHelloExtension = function(ext_types) {
       buf = new Buffer('000b00020100', 'hex'); // ec_point_formats(11) uncompressed(0)
       break;
     case ExtensionType.SupportedGroups:
-      buf = new Buffer('000a00020017', 'hex'); // supported_groups(10) (renamed from "elliptic_curves") secp256r1 (23)
+      buf = new Buffer('000a000400020017', 'hex'); // supported_groups(10) (renamed from "elliptic_curves") secp256r1 (23)
+      break;
+    case ExtensionType.SignatureAlgorithms:
+      buf = new Buffer('000d000400020401', 'hex'); // signature_algorithms(13)  sha256(4),rsa(1)
       break;
     default:
       throw new Error('Unknown Supported ExtensionType:' + ext_type);
@@ -642,16 +676,25 @@ TLSFrame.prototype.createClientKeyExchange = function(frame) {
   var state = connection.state;
   var type = HandshakeType.ClientKeyExchange;
 
-  var server_cert = state.cert_list[0];
-  var SubjectPublicKeyInfo = rfc3280.SubjectPublicKeyInfo;
-  var spk = SubjectPublicKeyInfo.encode(server_cert.subjectPublicKeyInfo, 'der');
-  var pubkey = common.toPEM(spk);
-  if (state.server_hello.cipher_suites === ecdhe_cipher) {
-    throw new Error('need Implement');
+  if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
+    var writer = new DataWriter(4);
+    writer.writeBytes(type, 1);
+    var curve_type = new Buffer('03', 'hex');    // named_curve
+    var named_curve = new Buffer('0017', 'hex'); // prime256v1
+    state.ClientECDHE = crypto.createECDH('prime256v1');
+    state.ClientECDHE.generateKeys();
+    var public_key = state.ClientECDHE.getPublicKey();
+    var public_key_length = new Buffer(1);
+    public_key_length.writeUInt8(public_key.length, 0);
+    writer.writeBytes(public_key.length + 1, 3);
+    var ECPoint =Buffer.concat([public_key_length, public_key]);
+    var preMasterSecret = state.ClientECDHE.computeSecret(state.serverPublicKey);
+    this.connection.state.pre_master_secret = preMasterSecret;
+    return this.createRecordHeader(ContentType.Handshake, Buffer.concat([writer.take(), ECPoint]));
   } else {
     var pre_master_secret = Buffer.concat([connection.state.client_hello.client_version, crypto.randomBytes(46)]);
     state.pre_master_secret = pre_master_secret;
-    var EncryptedPreMasterSecret = crypto.publicEncrypt({key:pubkey, padding: constants.RSA_PKCS1_PADDING}, pre_master_secret);
+    var EncryptedPreMasterSecret = crypto.publicEncrypt({key: connection.pubkey, padding: constants.RSA_PKCS1_PADDING}, pre_master_secret);
     var size = new Buffer(3);
     size.writeUIntBE(EncryptedPreMasterSecret.length + 2, 0, 3);
     var writer = new DataWriter(4 + EncryptedPreMasterSecret.length + 2);
@@ -679,9 +722,9 @@ TLSFrame.prototype.createServerKeyExchange = function(frame) {
   var ECParameters = Buffer.concat([curve_type, named_curve]);
   var ECPoint =Buffer.concat([public_key_length, public_key]);
   var ServerECDHParams = Buffer.concat([ECParameters, ECPoint]);
-  var signature_hash_algo = new Buffer('0601', 'hex'); // SHA512-RSA
+  var signature_hash_algo = new Buffer('0401', 'hex'); // SHA256-RSA
   var buf = Buffer.concat([state.client_hello.random, state.server_hello.random, ServerECDHParams]);
-  var sign = crypto.createSign('RSA-SHA512');
+  var sign = crypto.createSign('RSA-SHA256');
   sign.update(buf);
   var signature = Buffer.concat([new Buffer('0100', 'hex'), sign.sign(connection.key)]);
   var buf2 = Buffer.concat([ServerECDHParams, signature_hash_algo, signature]);
@@ -739,7 +782,8 @@ function TLSState() {
   this.pre_master_secret = null;
   this.sendFinished = false;
   this.recvFinished = false;
-  this.serverECDHE = null;
+  this.ServerECDHE = null;
+  this.ClientECDHE = null;
   this.serverPublicKey = null;
   this.clientECDHE = null;
   this.clientPublicKey = null;
@@ -832,4 +876,17 @@ function GenerateMasterSecret(connection) {
 function PRF12(algo, secret, label, seed, size) {
   var newSeed = Buffer.concat([new Buffer(label), seed]);
   return P_hash(algo, secret, newSeed, size);
+}
+
+function SelectCipher(list) {
+  assert(Array.isArray(list));
+  var cipher;
+  for(var i = 0; i < list.length; i++) {
+    cipher = list[i];
+    for(var j = 0; j < supported_cipher_list.length; j++) {
+      if (cipher.equals(supported_cipher_list[j]))
+        return cipher;
+    }
+  }
+  return null;
 }

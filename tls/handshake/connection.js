@@ -1,3 +1,4 @@
+var rfc3280 = require('asn1.js-rfc3280');
 var assert = require('assert');
 var util = require('util');
 var debug = util.debuglog('seccam');
@@ -17,11 +18,12 @@ var initial_cipher = common.initial_cipher;
 var ecdhe_cipher = common.ecdhe_cipher;
 var incSeq = common.incSeq;
 var fromPEM = common.fromPEM;
+var RevAlertLevel = common.RevAlertLevel;
+var RevAlertDescription = common.RevAlertDescription;
 
 exports.TLSConnection = TLSConnection;
 function TLSConnection(opts, is_server) {
   Transform.call(this);
-  this.socket = opts.socket;
   this.cert = opts.cert;
   this.ca = opts.ca;
   this.key = opts.key;
@@ -30,36 +32,40 @@ function TLSConnection(opts, is_server) {
   this.state = new TLSState();
   this.handshake_completed = false;
   this.nonce_explicit = crypto.randomBytes(8);
+  this.on('error', function(e) {
+    console.err('TLSConnection Error:' + e.msg);
+    this.destroy();
+  });
   this.on('ClientHello', function(frame) {
     this.state.client_hello = frame.data;
-    this.sendServerHello();
+    if (this.is_server)
+      this.sendServerHello();
   });
   this.on('ServerHello', function(frame) {
     this.state.server_hello = frame.data;
   });
+  this.on('ServerHelloDone', function(frame) {
+    this.state.server_hello_done = true;
+    this.sendClientKeyExchange();
+  });
+  this.on('ClientKeyExchange', function(frame) {
+    GenerateMasterSecret(this);
+  });
   this.on('ChangeCipherSpec', function() {
     this.state.read.encrypted = true;
-    var ClientHello = this.state.client_hello;
-    var ServerHello = this.state.server_hello;
-    var pre_master_secret = this.state.pre_master_secret;
-    var seed = Buffer.concat([ClientHello.random, ServerHello.random]);
-    var algo = this.state.securityParameters.prf_algorithm;
-    var master_secret = PRF12(algo, pre_master_secret, "master secret", seed, 48);
-    this.state.securityParameters.master_secret = master_secret;
-    seed = Buffer.concat([ServerHello.random, ClientHello.random]);
-    var key_block = PRF12(algo, master_secret, "key expansion", seed, 56);
-    var key_block_reader = new DataReader(key_block);
-    this.state.client_write_MAC_key = null;
-    this.state.server_write_MAC_key = null;
-    this.state.client_write_key = key_block_reader.readBytes(16);
-    this.state.server_write_key = key_block_reader.readBytes(16);
-    this.state.client_write_IV =  key_block_reader.readBytes(4);
-    this.state.server_write_IV = key_block_reader.readBytes(4);
-    this.sendChangeCipherSpec();
+    if (!this.state.write.encrypted)
+      this.sendChangeCipherSpec();
   });
   this.on('Finished', function() {
-    this.sendFinished();
+    if (!this.state.sendFinished)
+      this.sendFinished();
   });
+  var self = this;
+  if (!is_server) {
+    setImmediate(function() {
+      self.sendClientHello();
+    });
+  }
 }
 util.inherits(TLSConnection, Transform);
 
@@ -88,6 +94,7 @@ TLSConnection.prototype.processPacket = function (reader) {
     break;
   case ContentType.Alert:
     debug('TLS Alert Received');
+    this.processAlert(frame_reader);
     break;
   case ContentType.Handshake:
     this.processHandshake(frame, frame_reader);
@@ -113,6 +120,7 @@ TLSConnection.prototype._transform = function processPacket(chunk, encoding, cb)
 };
 
 TLSConnection.prototype.decrypt = function(frame, buf) {
+  var is_server = this.is_server;
   var record_header_type_version = frame.record_header.buf.slice(0, 3);
   var state = this.state;
   var nonce_explicit = buf.slice(0, 8);
@@ -121,8 +129,9 @@ TLSConnection.prototype.decrypt = function(frame, buf) {
   record_header_length.writeUInt16BE(enc_data.length);
   var record_header_buf = Buffer.concat([record_header_type_version, record_header_length]);
   var tag = buf.slice(-16);
-  var key = state.client_write_key;
-  var iv = Buffer.concat([state.client_write_IV.slice(0,4), nonce_explicit]);
+  var key = is_server ? state.client_write_key : state.server_write_key;
+  var write_IV = is_server ? state.client_write_IV: state.server_write_IV;
+  var iv = Buffer.concat([write_IV.slice(0,4), nonce_explicit]);
   var bob = crypto.createDecipheriv('aes-128-gcm', key, iv);
   bob.setAuthTag(tag);
   var aad = Buffer.concat([state.read.seq, record_header_buf]);
@@ -134,25 +143,41 @@ TLSConnection.prototype.decrypt = function(frame, buf) {
 
 TLSConnection.prototype.encrypt = function(buf) {
   var state = this.state;
+  var is_server = this.is_server;
   var record_header_type_version = buf.slice(0, 3);
   var record_header = buf.slice(0, 5);
   incSeq(this.nonce_explicit);
   var nonce_explicit = this.nonce_explicit;
   var clear_data = buf.slice(5);
 
-  var key = state.server_write_key;
-  var iv = Buffer.concat([state.server_write_IV.slice(0,4), nonce_explicit]);
+  var key = is_server ? state.server_write_key : state.client_write_key;
+  var write_IV = is_server ? state.server_write_IV : state.client_write_IV;
+  var iv = Buffer.concat([write_IV.slice(0,4), nonce_explicit]);
   var bob = crypto.createCipheriv('aes-128-gcm', key, iv);
   var aad = Buffer.concat([state.write.seq, record_header]);
   bob.setAAD(aad);
-  var encrypted = bob.update(clear_data);
-  bob.final();
+  var encrypted1 = bob.update(clear_data);
+  var encrypted2 = bob.final();
+  var encrypted = Buffer.concat([encrypted1, encrypted2]);
   var tag = bob.getAuthTag(tag);
   var record_header_length = new Buffer(2);
   record_header_length.writeUInt16BE(nonce_explicit.length + encrypted.length + tag.length);
   var record_header_buf = Buffer.concat([record_header_type_version, record_header_length]);
   var ret = Buffer.concat([record_header_buf, nonce_explicit, encrypted, tag]);
   return ret;
+};
+
+TLSConnection.prototype.processAlert = function processAlert(reader) {
+  var level = (reader.readBytes(1)).readUInt8(0);
+  assert(level === 1 || level === 2);
+  var level_str = RevAlertLevel[level];
+  var description = (reader.readBytes(1)).readUInt8(0);
+  var description_str = RevAlertDescription[description];
+  console.error('TLS Alert: level:' + level_str + ', desc:' +  description_str);
+
+  // fatal alert destroy connection
+  if (level === 2 && this.socket)
+    this.socket.destroy();
 };
 
 TLSConnection.prototype.processHandshake = function processHandshake(frame, reader) {
@@ -162,8 +187,8 @@ TLSConnection.prototype.processHandshake = function processHandshake(frame, read
   assert(!this.handshake_completed);
   var handshake_type = (reader.readBytes(1)).readUIntBE(0, 1);
   var length = (reader.readBytes(3)).readUIntBE(0, 3);
-  // assert(reader.bytesRemaining() >= length);
-  if (handshake_type !== HandshakeType.HelloRequest && handshake_type !== HandshakeType.Finished) {
+  if (handshake_type !== HandshakeType.HelloRequest &&
+      handshake_type !== HandshakeType.Finished) {
     pushHandshakeMessageBuf(state, buf);
   }
   switch(handshake_type) {
@@ -176,25 +201,29 @@ TLSConnection.prototype.processHandshake = function processHandshake(frame, read
     break;
     case HandshakeType.ServerHello:
     debug('ServerHello Received');
+    frame.processHello(reader, this.is_server);
     break;
     case HandshakeType.Certificate:
     debug('Certificate Received');
+    frame.processCertificate(reader, this.is_server);
     break;
     case HandshakeType.ServerKeyExchange:
     debug('ServerKeyExchange Received');
+    frame.processServerKeyExchange(reader, this.is_server);
     break;
     case HandshakeType.CertificateRequet:
     debug('CertificateRequest Received');
     break;
     case HandshakeType.ServerHelloDone:
     debug('ServerHelloDone Recevied');
+    frame.processServerHelloDone(reader, this.is_server);
     break;
     case HandshakeType.CertificateVerify:
     debug('CertificateVerify Received');
     break;
     case HandshakeType.ClientKeyExchange:
     debug('ClientKeyExchange Received');
-    frame.processClientKeyExchange(reader);
+    frame.processClientKeyExchange(reader, this.is_server);
     break;
     case HandshakeType.Finished:
     debug('Finished Received');
@@ -209,9 +238,8 @@ TLSConnection.prototype.processHandshake = function processHandshake(frame, read
 TLSConnection.prototype.processApplicationData = function(frame, reader) {
   var state = this.state;
   var buf = reader.readBytes(reader.bytesRemaining());
-  // data callback
-  debug('ApplicationData received', buf);
-  this.sendApplicationData(buf, null);
+  debug('ApplicationData Received', buf);
+  this.emit('clearData', buf);
 };
 
 TLSConnection.prototype.sendApplicationData = function(data, cb) {
@@ -224,14 +252,12 @@ TLSConnection.prototype.sendApplicationData = function(data, cb) {
 
 TLSConnection.prototype.sendPacket = function(buf, cb) {
   var state = this.state;
-  if (state.write.encrypted) {
+  if (state.write.encrypted)
     buf = this.encrypt(buf);
-  }
-  var self = this;
-  this.socket.write(buf, function() {
-    if (cb)
-      cb.call(self);
-  });
+
+  this.push(buf);
+  if (cb)
+    cb.call(this);
 };
 
 function pushHandshakeMessageBuf(state, buf) {
@@ -246,6 +272,22 @@ TLSConnection.prototype.sendHandshake = function(buf, cb) {
   this.sendPacket(buf, cb);
 };
 
+TLSConnection.prototype.sendClientHello = function() {
+  var client_hello_opts = {
+    client_version: initial_version,
+    random: crypto.randomBytes(32),
+    session_id: new Buffer(0),
+    cipher_suites: [initial_cipher],
+    compression_methods: new Buffer('00', 'hex')
+  };
+  this.state.client_hello = client_hello_opts;
+  var frame = new TLSFrame(this);
+  var buf = frame.createHello(frame, false, client_hello_opts);
+  this.sendHandshake(buf, function() {
+    debug('ClientHello sent');
+  });
+};
+
 TLSConnection.prototype.sendServerHello = function() {
   var client_hello = this.state.client_hello;
 //  var cipher_suite = initial_cipher;
@@ -255,7 +297,7 @@ TLSConnection.prototype.sendServerHello = function() {
     random: crypto.randomBytes(32),
     session_id: new Buffer(0),
     cipher_suites: cipher_suite,
-    compression_methods: (new Buffer(1)).fill(0),
+    compression_method: (new Buffer(1)).fill(0),
     extensions: [ExtensionType.EcPointFormats]
   };
   this.state.server_hello = server_hello_opts;
@@ -282,6 +324,18 @@ TLSConnection.prototype.sendServerCertificate = function() {
     } else {
       self.sendServerHelloDone();
     }
+  });
+};
+
+TLSConnection.prototype.sendClientKeyExchange = function() {
+  var self = this;
+  var frame = new TLSFrame(this);
+  var buf = frame.createClientKeyExchange(frame);
+  GenerateMasterSecret(this);
+  this.sendHandshake(buf, function() {
+    debug('ClientKeyExchange sent');
+    self.sendChangeCipherSpec();
+    self.sendFinished();
   });
 };
 
@@ -329,9 +383,8 @@ TLSConnection.prototype.sendChangeCipherSpec = function(frame) {
   var state = this.state;
   var buf = new Buffer('140303000101', 'hex');
   state.write.encrypted = true;
-  this.socket.write(buf, function() {
-    debug('ChangeCipherSpec sent');
-  });
+  this.push(buf);
+  debug('ChangeCipherSpec sent');
 };
 
 function TLSFrame(connection) {
@@ -389,10 +442,11 @@ TLSFrame.prototype.processHello = function(reader, is_server) {
     cipher_suites = reader.readBytes(2);
   }
   var compression_methods;
+  var compression_method;
   if (is_server) {
     compression_methods = reader.readVector(1, Math.pow(2, 8) - 1);
   } else {
-    compression_methods = reader.readBytes(1);
+    compression_method = reader.readBytes(1);
   }
   if (reader.bytesRemaining() > 0) {
     var extensions = reader.readVector(2, Math.pow(2, 16) - 1);
@@ -405,6 +459,7 @@ TLSFrame.prototype.processHello = function(reader, is_server) {
     session_id: session_id,
     cipher_suites: cipher_suites,
     compression_methods: compression_methods,
+    compression_method: compression_method,
     extensions: extensions
   };
 
@@ -440,6 +495,37 @@ TLSFrame.prototype.processClientKeyExchange = function(reader) {
     assert.strictEqual(preMasterSecret.length, 48);
   }
   this.connection.state.pre_master_secret = preMasterSecret;
+  connection.emit('ClientKeyExchange');
+};
+
+TLSFrame.prototype.processCertificate = function(reader, is_server) {
+  var connection = this.connection;
+  var state = connection.state;
+  var cert_list = state.cert_list;
+  var certificate_list = reader.readVector(0, Math.pow(2, 24) - 1);
+  var certlist_reader = new DataReader(certificate_list);
+  while(certlist_reader.bytesRemaining() > 0) {
+    var cert = certlist_reader.readVector(0, Math.pow(2, 24) - 1);
+    try {
+    var res = rfc3280.Certificate.decode(cert, 'der');
+    } catch(e) {
+      throw new Error('Certificate parse Error:', cert);
+    }
+    var tbs = res.tbsCertificate;
+    cert_list.push(tbs);
+  }
+  connection.emit('Certificate');
+};
+
+TLSFrame.prototype.processServerKeyExchange = function(reader, is_server) {
+  var connection = this.connection;
+  connection.emit('ServerKeyExchange');
+};
+
+TLSFrame.prototype.processServerHelloDone = function(reader, is_server) {
+  assert(!is_server);
+  var connection = this.connection;
+  connection.emit('ServerHelloDone');
 };
 
 TLSFrame.prototype.processFinished = function(reader, finished_buf) {
@@ -465,7 +551,8 @@ TLSFrame.prototype.processFinished = function(reader, finished_buf) {
   debug('Finished verified. verify_data:', r);
   state.recvFinished = true;
   if (state.recvFinished && state.sendFinished) {
-    this.connection.handshake_completed = true;
+    connection.handshake_completed = true;
+    connection.emit('secureConnection');
   }
   pushHandshakeMessageBuf(state, finished_buf);
   connection.emit('Finished');
@@ -473,11 +560,14 @@ TLSFrame.prototype.processFinished = function(reader, finished_buf) {
 
 TLSFrame.prototype.createHello = function(frame, is_server, opts) {
   var type = is_server ? HandshakeType.ServerHello: HandshakeType.ClientHello ;
-  var ext = this.createHelloExtension(opts.extensions);
-  var size = getHelloSize(opts, type) + ext.length;
+  var size = getHelloSize(opts, type);
+  if (opts.extensions) {
+    var ext = this.createHelloExtension(opts.extensions);
+    size += ext.length;
+  }
   var writer = new DataWriter(size + 4); // add type, length
   var version = is_server ? opts.server_version: opts.client_version;
-  writer.writeBytes(HandshakeType.ServerHello, 1);
+  writer.writeBytes(type, 1);
   writer.writeBytes(size, 3);
   writer.writeBytes(version, version.length);
   writer.writeBytes(opts.random, opts.random.length);
@@ -485,7 +575,7 @@ TLSFrame.prototype.createHello = function(frame, is_server, opts) {
   if (type === HandshakeType.ServerHello) {
     // Send ServerHello
     writer.writeBytes(opts.cipher_suites, opts.cipher_suites.length);
-    writer.writeBytes(opts.compression_methods, opts.compression_methods.length);
+    writer.writeBytes(opts.compression_method, opts.compression_method.length);
   } else {
     // Send ClientHello
     var buf = Buffer.concat(opts.cipher_suites);
@@ -493,7 +583,7 @@ TLSFrame.prototype.createHello = function(frame, is_server, opts) {
     writer.writeVector(opts.compression_methods, opts.compression_methods.length, Math.pow(2,8) - 2);
   }
 
-  if (opts.extensions.length) {
+  if (opts.extensions && opts.extensions.length) {
     writer.writeBytes(ext, ext.length);
   }
 
@@ -512,6 +602,9 @@ TLSFrame.prototype.createHelloExtension = function(ext_types) {
     switch(ext_type) {
     case ExtensionType.EcPointFormats:
       buf = new Buffer('000b00020100', 'hex'); // ec_point_formats(11) uncompressed(0)
+      break;
+    case ExtensionType.SupportedGroups:
+      buf = new Buffer('000a00020017', 'hex'); // supported_groups(10) (renamed from "elliptic_curves") secp256r1 (23)
       break;
     default:
       throw new Error('Unknown Supported ExtensionType:' + ext_type);
@@ -542,6 +635,32 @@ TLSFrame.prototype.createCertificate = function(frame, is_server, opts) {
   }
   var b = writer.take();
   return this.createRecordHeader(ContentType.Handshake, b);
+};
+
+TLSFrame.prototype.createClientKeyExchange = function(frame) {
+  var connection = this.connection;
+  var state = connection.state;
+  var type = HandshakeType.ClientKeyExchange;
+
+  var server_cert = state.cert_list[0];
+  var SubjectPublicKeyInfo = rfc3280.SubjectPublicKeyInfo;
+  var spk = SubjectPublicKeyInfo.encode(server_cert.subjectPublicKeyInfo, 'der');
+  var pubkey = common.toPEM(spk);
+  if (state.server_hello.cipher_suites === ecdhe_cipher) {
+    throw new Error('need Implement');
+  } else {
+    var pre_master_secret = Buffer.concat([connection.state.client_hello.client_version, crypto.randomBytes(46)]);
+    state.pre_master_secret = pre_master_secret;
+    var EncryptedPreMasterSecret = crypto.publicEncrypt({key:pubkey, padding: constants.RSA_PKCS1_PADDING}, pre_master_secret);
+    var size = new Buffer(3);
+    size.writeUIntBE(EncryptedPreMasterSecret.length + 2, 0, 3);
+    var writer = new DataWriter(4 + EncryptedPreMasterSecret.length + 2);
+    writer.writeBytes(type, 1);
+    writer.writeBytes(size, 3);
+    writer.writeVector(EncryptedPreMasterSecret, EncryptedPreMasterSecret.length, Math.pow(2, 16)-1);
+    var buf = this.createRecordHeader(ContentType.Handshake, writer.take());
+    return buf;
+  }
 };
 
 TLSFrame.prototype.createServerKeyExchange = function(frame) {
@@ -615,6 +734,8 @@ function TLSState() {
   };
   this.client_hello = null;
   this.server_hello = null;
+  this.server_hello_done = false;
+  this.cert_list = [];
   this.pre_master_secret = null;
   this.sendFinished = false;
   this.recvFinished = false;
@@ -653,7 +774,7 @@ function getHelloSize(opts, type) {
   size += getVectorSize(opts.session_id, 32);
   if (HandshakeType.ServerHello === type) {
     size += opts.cipher_suites.length;
-    size += opts.compression_methods.length;
+    size += opts.compression_method.length;
   } else {
     size += getVectorSize(Buffer.concat(opts.cipher_suites), Math.pow(2, 16) - 2);
     size += getVectorSize(opts.compression_methods, Math.pow(2, 8) - 1);
@@ -687,6 +808,25 @@ function P_hash(algo, secret, seed, size) {
   }
 
   return result;
+}
+
+function GenerateMasterSecret(connection) {
+  var ClientHello = connection.state.client_hello;
+  var ServerHello = connection.state.server_hello;
+  var pre_master_secret = connection.state.pre_master_secret;
+  var seed = Buffer.concat([ClientHello.random, ServerHello.random]);
+  var algo = connection.state.securityParameters.prf_algorithm;
+  var master_secret = PRF12(algo, pre_master_secret, "master secret", seed, 48);
+  connection.state.securityParameters.master_secret = master_secret;
+  seed = Buffer.concat([ServerHello.random, ClientHello.random]);
+  var key_block = PRF12(algo, master_secret, "key expansion", seed, 56);
+  var key_block_reader = new DataReader(key_block);
+  connection.state.client_write_MAC_key = null;
+  connection.state.server_write_MAC_key = null;
+  connection.state.client_write_key = key_block_reader.readBytes(16);
+  connection.state.server_write_key = key_block_reader.readBytes(16);
+  connection.state.client_write_IV =  key_block_reader.readBytes(4);
+  connection.state.server_write_IV = key_block_reader.readBytes(4);
 }
 
 function PRF12(algo, secret, label, seed, size) {

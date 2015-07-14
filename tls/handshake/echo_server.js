@@ -10,9 +10,13 @@ var opts = {
 
 var port = 443;
 var server = net.createServer(function(s) {
-  opts.socket = s;
   var tlsConnection = new TLSConnection(opts, true);
-  tlsConnection.pipe(s);
   s.pipe(tlsConnection);
+  tlsConnection.pipe(s);
+  tlsConnection.on('clearData', function(c) {
+    tlsConnection.sendApplicationData(c);
+  });
 });
-server.listen(port);
+server.listen(port, function() {
+  console.log('Listening port:' + port);
+});

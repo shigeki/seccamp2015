@@ -69,6 +69,50 @@ exports.ExtensionType = {
 
 exports.RevExtensionType = Rev(exports.ExtensionType);
 
+exports.AlertLevel = {
+  warning: 1,
+  fatal: 2
+};
+
+exports.RevAlertLevel = Rev(exports.AlertLevel);
+
+// TLS Alert Registry
+// http://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-parameters-6
+exports.AlertDescription = {
+  close_notify: 0,
+  unexpected_message: 10,
+  bad_record_mac: 20,
+  decryption_failed_RESERVED: 21,
+  record_overflow: 22,
+  decompression_failure: 30,
+  handshake_failure: 40,
+  no_certificate_RESERVED: 41,
+  bad_certificate: 42,
+  unsupported_certificate: 43,
+  certificate_revoked: 44,
+  certificate_expired: 45,
+  certificate_unknown: 46,
+  illegal_parameter: 47,
+  unknown_ca: 48,
+  access_denied: 49,
+  decode_error: 50,
+  decrypt_error: 51,
+  export_restriction_RESERVED: 60,
+  protocol_version: 70,
+  insufficient_security: 71,
+  internal_error: 80,
+  user_canceled: 90,
+  no_renegotiation: 100,
+  unsupported_extension: 110,
+  certificate_unobtainable: 111,
+  unrecognized_name: 112,
+  bad_certificate_status_response: 113,
+  bad_certificate_hash_value: 114,
+  unknown_psk_identity: 115
+};
+
+exports.RevAlertDescription = Rev(exports.AlertDescription);
+
 exports.IntegerToBytes = IntegerToBytes;
 function IntegerToBytes(n) {
   assert.strictEqual(typeof n, 'number');
@@ -98,4 +142,17 @@ function fromPEM(data) {
   });
   text = text.slice(1, -1).join('');
   return new Buffer(text.replace(/[^\w\d\+\/=]+/g, ''), 'base64');
+};
+
+exports.toPEM = toPEM;
+function toPEM(data) {
+var begin = '-----BEGIN PUBLIC KEY-----\n';
+var end = '-----END PUBLIC KEY-----\n';
+  var encode = data.toString('base64');
+  var ret = '';
+  for(var i = 0; i < encode.length; i += 64) {
+    var a = encode.slice(i, i + 64);
+    ret += (a + '\n');
+  }
+  return begin + ret  + end;
 };

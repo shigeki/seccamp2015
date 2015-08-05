@@ -275,9 +275,11 @@ TLSConnection.prototype.sendHandshake = function(buf, cb) {
 };
 
 TLSConnection.prototype.sendClientHello = function() {
+  var gmt_time = new Buffer(4);
+  gmt_time.writeUInt32BE(parseInt(Date.now()/1000), 0);
   var client_hello_opts = {
     client_version: initial_version,
-    random: crypto.randomBytes(32),
+    random: Buffer.concat([gmt_time, crypto.randomBytes(28)]),
     session_id: new Buffer(0),
     cipher_suites: supported_cipher_list,
     compression_methods: new Buffer('00', 'hex'),
@@ -863,7 +865,7 @@ function GenerateMasterSecret(connection) {
   var master_secret = PRF12(algo, pre_master_secret, "master secret", seed, 48);
   connection.state.securityParameters.master_secret = master_secret;
   seed = Buffer.concat([ServerHello.random, ClientHello.random]);
-  var key_block = PRF12(algo, master_secret, "key expansion", seed, 56);
+  var key_block = PRF12(algo, master_secret, "key expansion", seed, 40);
   var key_block_reader = new DataReader(key_block);
   connection.state.client_write_MAC_key = null;
   connection.state.server_write_MAC_key = null;

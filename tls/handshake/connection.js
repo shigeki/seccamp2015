@@ -302,9 +302,12 @@ TLSConnection.prototype.sendServerHello = function() {
     random: crypto.randomBytes(32),
     session_id: new Buffer(0),
     cipher_suites: cipher_suite,
-    compression_method: (new Buffer(1)).fill(0),
-    extensions: [ExtensionType.EcPointFormats]
+    compression_method: (new Buffer(1)).fill(0)
   };
+
+  if (cipher_suite.equals(ecdhe_cipher))
+    server_hello_opts.extensions = [ExtensionType.EcPointFormats];
+
   this.state.server_hello = server_hello_opts;
   var frame = new TLSFrame(this);
   var buf = frame.createHello(frame, true, server_hello_opts);

@@ -2,9 +2,6 @@ var assert = require('assert');
 var crypto = require('crypto');
 var DataReader = require('/home/ohtsu/github/seccamp2015-data-reader/index.js').DataReader;
 
-var nonce_explicit = crypto.randomBytes(8);
-var write_seq = (new Buffer(8)).fill(0);
-var read_seq = (new Buffer(8)).fill(0);
 function incSeq(buf){
   var i;
   for(i=buf.length-1;i>=0;i--){
@@ -14,7 +11,7 @@ function incSeq(buf){
     }
     buf[i]=0x00;
   }
-};
+}
 
 var type = {
   changecipherspec: 0x14,
@@ -73,7 +70,9 @@ function createHandshake(type, data) {
   return Buffer.concat([header, data]);
 }
 
-exports.createClientHello = function (json) {
+exports.createClientHello = createClientHello;
+function createClientHello(json, state) {
+  state.handshake.clienthello_json = json;
   var version = json.version;
   var random = json.random;
   var session_id = writeVector(json.session_id, 0, 32);
@@ -81,12 +80,14 @@ exports.createClientHello = function (json) {
   var compression = writeVector(json.compression, 0, 1 << 8 -1);
   var handshake = createHandshake(handshake_type.clienthello, Buffer.concat([version, random, session_id, cipher_suites, compression]));
   return createRecord(type.handshake, handshake);
-};
+}
 
-exports.parseServerHello = function(reader, handshake_message_list) {
+exports.parseServerHello = parseServerHello;
+function parseServerHello(reader, state) {
   if (!checkRecordHeader(reader))
     return null;
 
+  var handshake_message_list = state.handshake_message_list;
   var record_header = parseRecordHeader(reader);
   var handshake_msg_buf = reader.peekBytes(0, record_header.length);
   handshake_message_list.push(handshake_msg_buf);
@@ -98,7 +99,7 @@ exports.parseServerHello = function(reader, handshake_message_list) {
   var cipher = reader.readBytes(2);
   var compression = reader.readBytes(1);
 
-  return {
+  state.handshake.serverhello_json = {
     record_header: record_header,
     type: type,
     length: length,
@@ -108,12 +109,15 @@ exports.parseServerHello = function(reader, handshake_message_list) {
     cipher: cipher,
     compression: compression
   };
-};
+  return true;
+}
 
-exports.parseCertificate = function(reader, handshake_message_list) {
+exports.parseCertificate = parseCertificate;
+function parseCertificate(reader, state) {
   if (!checkRecordHeader(reader))
     return null;
 
+  var handshake_message_list = state.handshake_message_list;
   var record_header = parseRecordHeader(reader);
   var handshake_msg_buf = reader.peekBytes(0, record_header.length);
   handshake_message_list.push(handshake_msg_buf);
@@ -125,37 +129,44 @@ exports.parseCertificate = function(reader, handshake_message_list) {
     var cert = cert_reader.readVector(0, 1 << 24 - 1);
     certlist.push(cert);
   }
-  return {
+
+  state.handshake.certificate_json = {
     record_header: record_header,
     type: type,
     length: length,
-    certlist: certlist,
-    buf: handshake_msg_buf
+    certlist: certlist
   };
-};
+  return true;
+}
 
-exports.parseServerHelloDone = function(reader, handshake_message_list) {
+exports.parseServerHelloDone = parseServerHelloDone;
+function parseServerHelloDone(reader, state) {
   if (!checkRecordHeader(reader))
     return null;
 
+  var handshake_message_list = state.handshake_message_list;
   var record_header = parseRecordHeader(reader);
   var handshake_msg_buf = reader.peekBytes(0, record_header.length);
   handshake_message_list.push(handshake_msg_buf);
   var type = reader.readBytes(1).readUIntBE(0, 1);
   var length = reader.readBytes(3).readUIntBE(0, 3);
 
-  return {
+  state.handshake.serverhellodone_json = {
     record_header: record_header,
     type: type,
     length: length,
     buf: handshake_msg_buf
   };
-};
+  return true;
+}
 
-exports.parseServerFinished = function(reader, master_secret, handshake_message_list) {
+exports.parseServerFinished = parseServerFinished;
+function parseServerFinished(reader, state) {
   if (!checkRecordHeader(reader))
     return null;
 
+  var master_secret = state.keyblock_json.master_secret;
+  var handshake_message_list = state.handshake_message_list;
   var record_header = parseRecordHeader(reader);
   var type = reader.readBytes(1).readUIntBE(0, 1);
   var length = reader.readBytes(3).readUIntBE(0, 3);
@@ -168,15 +179,17 @@ exports.parseServerFinished = function(reader, master_secret, handshake_message_
 
   assert(r.equals(verify_data));
 
-  return {
+  state.handshake.serverfinished_json = {
     record_header: record_header,
     type: type,
     length: length,
     verify_data: verify_data
   };
-};
+  return true;
+}
 
-exports.parseApplicationData = function(reader) {
+exports.parseApplicationData = parseApplicationData;
+function parseApplicationData(reader) {
   if (!checkRecordHeader(reader))
     return null;
 
@@ -186,7 +199,7 @@ exports.parseApplicationData = function(reader) {
     record_header: record_header,
     data: data
   };
-};
+}
 
 function P_hash(algo, secret, seed, size) {
   var result = (new Buffer(size)).fill(0);
@@ -219,7 +232,7 @@ function PRF12(secret, label, seed, size) {
   return P_hash('sha256', secret, newSeed, size);
 }
 
-exports.KDF = function(pre_master_secret, clienthello_json, serverhello_json) {
+function KDF(pre_master_secret, clienthello_json, serverhello_json) {
   var client_random = clienthello_json.random;
   var server_random = serverhello_json.random;
   var master_secret = PRF12(pre_master_secret, "master secret", Buffer.concat([client_random, server_random]), 48);
@@ -237,9 +250,11 @@ exports.KDF = function(pre_master_secret, clienthello_json, serverhello_json) {
     client_write_IV: key_block_reader.readBytes(4),
     server_write_IV: key_block_reader.readBytes(4)
   };
-};
+}
 
-exports.createClientKeyExchange = function(json) {
+exports.createClientKeyExchange = createClientKeyExchange;
+function createClientKeyExchange(json, state) {
+  state.handshake.clientkeyexchange_json = json;
   var public_key = json.pubkey;
   var pre_master_secret = json.pre_master_secret;
   var encrypted = crypto.publicEncrypt({
@@ -251,43 +266,34 @@ exports.createClientKeyExchange = function(json) {
   return createRecord(type.handshake, handshake);
 };
 
-exports.createChangeCipherSpec = function() {
+exports.createChangeCipherSpec = createChangeCipherSpec;
+function createChangeCipherSpec() {
   return new Buffer('140303000101', 'hex');
 };
 
-exports.createClientFinished = function(json) {
+exports.createClientFinished = createClientFinished;
+function createClientFinished(json, state) {
+  state.handshake.clientfinished_json = json;
   var shasum = crypto.createHash('sha256');
   shasum.update(Buffer.concat(json.handshake_message_list));
   var message_hash = shasum.digest();
   var r = PRF12(json.master_secret, "client finished", message_hash, 12);
   var handshake = createHandshake(handshake_type.finished, r);
   return createRecord(type.handshake, handshake);
-};
+}
 
-exports.createApplicationData = function(data) {
+exports.createApplicationData = createApplicationData;
+function createApplicationData(data) {
   return createRecord(type.application, data);
-};
+}
 
-exports.EncryptAEAD = function(frame, writekey, write_IV) {
-  var iv = Buffer.concat([write_IV.slice(0,4), nonce_explicit]);
-  var bob = crypto.createCipheriv('aes-128-gcm', writekey, iv);
-  var record_header = frame.slice(0, 5);
-  var aad = Buffer.concat([write_seq, record_header]);
-  bob.setAAD(aad);
-  var clear = frame.slice(5);
-  var encrypted1 = bob.update(clear);
-  var encrypted2 = bob.final();
-  var encrypted = Buffer.concat([encrypted1, encrypted2]);
-  var tag = bob.getAuthTag(tag);
-  incSeq(write_seq);
-  var length = new Buffer(2);
-  length.writeUIntBE(nonce_explicit.length + encrypted.length + tag.length, 0, 2);
-  return Buffer.concat([record_header.slice(0, 3), length, nonce_explicit, encrypted, tag]);
-};
-
-exports.DecryptAEAD = function(reader, key, IV) {
+exports.DecryptAEAD = DecryptAEAD;
+function DecryptAEAD(reader, state) {
   if (!checkRecordHeader(reader))
     return null;
+
+  var write_key = state.keyblock_json.server_write_key;
+  var write_iv = state.keyblock_json.server_write_IV;
 
   var record_header_type_version = reader.peekBytes(0, 3);
   var record_header = parseRecordHeader(reader);
@@ -298,16 +304,93 @@ exports.DecryptAEAD = function(reader, key, IV) {
   record_header_length.writeUInt16BE(enc_data.length);
   var record_header_buf = Buffer.concat([record_header_type_version, record_header_length]);
   var tag = frame.slice(-16);
-  var iv = Buffer.concat([IV.slice(0,4), nonce_explicit]);
-  var bob = crypto.createDecipheriv('aes-128-gcm', key, iv);
+  var iv = Buffer.concat([write_iv.slice(0,4), nonce_explicit]);
+  var bob = crypto.createDecipheriv('aes-128-gcm', write_key, iv);
   bob.setAuthTag(tag);
-  var aad = Buffer.concat([read_seq, record_header_buf]);
+  var aad = Buffer.concat([state.read_seq, record_header_buf]);
   bob.setAAD(aad);
   var clear = bob.update(enc_data);
   var length = new Buffer(2);
   length.writeUIntBE(clear.length, 0, 2);
   bob.final();
-  incSeq(read_seq);
+  incSeq(state.read_seq);
   var buf = reader.readBytes(reader.bytesRemaining());
   return new DataReader(Buffer.concat([record_header_type_version, length, clear, buf]));
-};
+}
+
+exports.parseHandshake = parseHandshake;
+function parseHandshake(reader, state) {
+  var type = reader.peekBytes(5, 6).readUIntBE(0, 1);
+  switch(type) {
+  case 0x02:
+    if (!parseServerHello(reader, state))
+      return null;
+    break;
+  case 0x0b:
+    if (!parseCertificate(reader, state))
+      return null;
+    break;
+  case 0x0e:
+    if (!parseServerHelloDone(reader, state))
+      return null;
+
+    var pre_master_secret = Buffer.concat([state.handshake.clienthello_json.version, crypto.randomBytes(46)]);
+    state.keyblock_json = KDF(pre_master_secret, state.handshake.clienthello_json, state.handshake.serverhello_json);
+    var clientkeyexchange_json = {
+      pre_master_secret: pre_master_secret,
+      pubkey: require('fs').readFileSync('/home/ohtsu/pubkey.pem')
+    };
+    var clientkeyexchange = createClientKeyExchange(clientkeyexchange_json, state);
+    sendTLSFrame(clientkeyexchange, state);
+    var changecipherspec = createChangeCipherSpec();
+    sendTLSFrame(changecipherspec, state);
+    state.send_encrypted = true;
+    var clientfinished_json = {
+      master_secret: state.keyblock_json.master_secret,
+      handshake_message_list: state.handshake_message_list
+    };
+    var clientfinished = createClientFinished(clientfinished_json, state);
+    sendTLSFrame(clientfinished, state);
+    break;
+  case 0x14:
+    if(!parseServerFinished(reader, state))
+      return null;
+
+    console.log('Handshake Completed');
+    state.socket.emit('secureConnection');
+    break;
+  default:
+    throw new Error('Unknown handshake type:' +  type);
+  }
+
+  return reader;
+}
+
+exports.sendTLSFrame = sendTLSFrame;
+function sendTLSFrame(frame, state) {
+  if (frame[0] === type.handshake)
+    state.handshake_message_list.push(frame.slice(5));
+
+  if (state.send_encrypted)
+    frame = EncryptAEAD(frame, state);
+
+  state.socket.write(frame);
+}
+
+exports.EncryptAEAD = EncryptAEAD;
+function EncryptAEAD(frame, state) {
+  var iv = Buffer.concat([state.keyblock_json.client_write_IV.slice(0,4), state.nonce_explicit]);
+  var bob = crypto.createCipheriv('aes-128-gcm', state.keyblock_json.client_write_key, iv);
+  var record_header = frame.slice(0, 5);
+  var aad = Buffer.concat([state.write_seq, record_header]);
+  bob.setAAD(aad);
+  var clear = frame.slice(5);
+  var encrypted1 = bob.update(clear);
+  var encrypted2 = bob.final();
+  var encrypted = Buffer.concat([encrypted1, encrypted2]);
+  var tag = bob.getAuthTag(tag);
+  incSeq(state.write_seq);
+  var length = new Buffer(2);
+  length.writeUIntBE(state.nonce_explicit.length + encrypted.length + tag.length, 0, 2);
+  return Buffer.concat([record_header.slice(0, 3), length, state.nonce_explicit, encrypted, tag]);
+}

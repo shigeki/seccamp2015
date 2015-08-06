@@ -1,6 +1,5 @@
-var assert = require('assert');
-var net = require('net'), crypto = require('crypto');
-var DataReader = require('/home/ohtsu/github/seccamp2015-data-reader/index.js').DataReader;
+var assert = require('assert'), net = require('net'), crypto = require('crypto');
+var DataReader = require('seccamp2015-data-reader').DataReader;
 var SecCampTLS = require('./seccamp2015-TLS.js');
 
 function TLSState(socket, is_server) {
@@ -21,7 +20,7 @@ var clienthello_json = {
   random: crypto.randomBytes(32),
   session_id: new Buffer(0),
   cipher_suites: [new Buffer('009C', 'hex')],
-  compression: (new Buffer(1)).fill(0)
+  compression: new Buffer('00', 'hex')
 };
 
 var client = net.connect({host: 'localhost', port: 443}, function() {
@@ -47,28 +46,27 @@ var client = net.connect({host: 'localhost', port: 443}, function() {
 
 
 function parseFrame(reader, state) {
-  if (state.recv_encrypted)
-    reader = SecCampTLS.DecryptAEAD(reader,state);
+  if (!reader || 5 > reader.bytesRemaining())
+    return;
 
-  var type = reader.peekBytes(0, 1).readUIntBE(0, 1);
+  if (state.recv_encrypted)
+    reader = SecCampTLS.DecryptAEAD(reader, state);
+
+  var type = reader.peekBytes(0, 1).readUInt8(0);
   switch(type) {
   case 0x14:
     console.log('ChangeCipherSpec');
+    assert(state.keyblock_json.master_secret, 'Not Key Negotiated Yet');
     reader.readBytes(6);
-    assert(state.keyblock_json.master_secret);
     state.recv_encrypted = true;
-    if (reader.bytesRemaining() > 5)
-      parseFrame(reader, state);
     break;
   case 0x15:
     console.log('TLS Alert');
+    // ToDo implement
     break;
   case 0x16:
     console.log('Handshake');
     reader = SecCampTLS.parseHandshake(reader, state);
-    if (reader && reader.bytesRemaining() >= 5)
-      parseFrame(reader, state);
-
     break;
   case 0x17:
     console.log('Application Data');
@@ -78,4 +76,5 @@ function parseFrame(reader, state) {
   default:
     throw new Error('Unknown msg type:' + type);
   }
+  parseFrame(reader, state);
 };

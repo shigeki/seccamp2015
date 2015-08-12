@@ -1,6 +1,8 @@
-var assert = require('assert'), net = require('net'), crypto = require('crypto');
+var assert = require('assert');
+var net = require('net');
+var crypto = require('crypto');
 var DataReader = require('seccamp2015-data-reader').DataReader;
-var SecCampTLS = require('./seccamp2015-TLS.js');
+var SecCampTLS = require('seccamp2015-TLS.js');
 
 function TLSState(socket, is_server) {
   this.is_server = is_server;
@@ -66,7 +68,7 @@ function parseFrame(reader, state) {
     break;
   case 0x16:
     console.log('Handshake');
-    reader = SecCampTLS.parseHandshake(reader, state);
+    reader = parseHandshake(reader, state);
     break;
   case 0x17:
     console.log('Application Data');
@@ -78,3 +80,34 @@ function parseFrame(reader, state) {
   }
   parseFrame(reader, state);
 };
+
+function parseHandshake(reader, state) {
+  var type = reader.peekBytes(5, 6).readUInt8(0);
+  switch(type) {
+  case 0x02:
+    if (!SecCampTLS.parseServerHello(reader, state))
+      return null;
+    break;
+  case 0x0b:
+    if (!SecCampTLS.parseCertificate(reader, state))
+      return null;
+    break;
+  case 0x0e:
+    if (!SecCampTLS.parseServerHelloDone(reader, state))
+      return null;
+
+    SecCampTLS.sendClientFrame(state);
+    break;
+  case 0x14:
+    if(!SecCampTLS.parseServerFinished(reader, state))
+      return null;
+
+    console.log('Handshake Completed');
+    state.socket.emit('secureConnection');
+    break;
+  default:
+    throw new Error('Unknown handshake type:' +  type);
+  }
+
+  return reader;
+}

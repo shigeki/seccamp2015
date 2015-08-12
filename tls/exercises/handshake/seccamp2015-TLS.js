@@ -3,12 +3,12 @@ var DataReader = require('seccamp2015-data-reader').DataReader;
 
 function incSeq(buf){
   var i;
-  for(i=buf.length-1;i>=0;i--){
-    if(buf[i]<0xff){
+  for(i=buf.length-1; i >= 0;i--){
+    if(buf[i] < 0xff){
       buf[i]++;
       break;
     }
-    buf[i]=0x00;
+    buf[i] = 0x00;
   }
 }
 
@@ -336,38 +336,6 @@ function sendClientFrame(state) {
     };
     var clientfinished = createClientFinished(clientfinished_json, state);
     sendTLSFrame(clientfinished, state);
-}
-
-exports.parseHandshake = parseHandshake;
-function parseHandshake(reader, state) {
-  var type = reader.peekBytes(5, 6).readUInt8(0);
-  switch(type) {
-  case 0x02:
-    if (!parseServerHello(reader, state))
-      return null;
-    break;
-  case 0x0b:
-    if (!parseCertificate(reader, state))
-      return null;
-    break;
-  case 0x0e:
-    if (!parseServerHelloDone(reader, state))
-      return null;
-
-    sendClientFrame(state);
-    break;
-  case 0x14:
-    if(!parseServerFinished(reader, state))
-      return null;
-
-    console.log('Handshake Completed');
-    state.socket.emit('secureConnection');
-    break;
-  default:
-    throw new Error('Unknown handshake type:' +  type);
-  }
-
-  return reader;
 }
 
 exports.sendTLSFrame = sendTLSFrame;

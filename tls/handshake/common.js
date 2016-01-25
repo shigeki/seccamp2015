@@ -3,6 +3,7 @@ var assert = require('assert');
 exports.initial_version = new Buffer('0303', 'hex'); // TLS1.2 (RFC5246)
 exports.initial_cipher = new Buffer('009C', 'hex');  // TLS_RSA_WITH_AES_128_GCM_SHA256 (RFC4492)
 exports.ecdhe_cipher = new Buffer('C02F', 'hex');    // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (RFC5239)
+exports.chacha20_cipher = new Buffer('CCA8', 'hex'); // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256  {0xCC, 0xA8}
 exports.ecdhe_curve_name = 'prime256v1';
 
 function Rev(obj) {

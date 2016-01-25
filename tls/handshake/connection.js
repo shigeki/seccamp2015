@@ -16,11 +16,18 @@ var getVectorSize = common.getVectorSize;
 var initial_version = common.initial_version;
 var initial_cipher = common.initial_cipher;
 var ecdhe_cipher = common.ecdhe_cipher;
+var chacha20_cipher = common.chacha20_cipher;
 var incSeq = common.incSeq;
 var fromPEM = common.fromPEM;
 var RevAlertLevel = common.RevAlertLevel;
 var RevAlertDescription = common.RevAlertDescription;
-var supported_cipher_list = [ecdhe_cipher, initial_cipher];
+//var supported_cipher_list = [chacha20_cipher, ecdhe_cipher, initial_cipher];
+var supported_cipher_list = [chacha20_cipher];
+//  ChaCha20Poly1305Encrypt(aad, key, nonce, plaintext)
+var ChaCha20Poly1305Encrypt = require('./crypto/chacha20_poly1305.js').ChaCha20Poly1305Encrypt;
+//  ChaCha20Poly1305Decrypt(aad, key, nonce, ciphertext)
+var ChaCha20Poly1305Decrypt = require('./crypto/chacha20_poly1305.js').ChaCha20Poly1305Decrypt;
+
 
 exports.TLSConnection = TLSConnection;
 function TLSConnection(opts, is_server) {
@@ -35,8 +42,9 @@ function TLSConnection(opts, is_server) {
   this.handshake_completed = false;
   this.nonce_explicit = crypto.randomBytes(8);
   this.on('error', function(e) {
-    console.err('TLSConnection Error:' + e.msg);
-    this.destroy();
+    console.error('TLSConnection Error:' + e);
+    //this.destroy();
+    this.end();
   });
   this.on('ClientHello', function(frame) {
     this.state.client_hello = frame.data;
@@ -125,21 +133,24 @@ TLSConnection.prototype.decrypt = function(frame, buf) {
   var is_server = this.is_server;
   var record_header_type_version = frame.record_header.buf.slice(0, 3);
   var state = this.state;
-  var nonce_explicit = buf.slice(0, 8);
-  var enc_data = buf.slice(8, buf.length - 16);
+//  var nonce_explicit = buf.slice(0, 8);
+  var enc_data = buf.slice(0, buf.length - 16);
   var record_header_length = new Buffer(2);
   record_header_length.writeUInt16BE(enc_data.length);
   var record_header_buf = Buffer.concat([record_header_type_version, record_header_length]);
   var tag = buf.slice(-16);
   var key = is_server ? state.client_write_key : state.server_write_key;
+
   var write_IV = is_server ? state.client_write_IV: state.server_write_IV;
-  var iv = Buffer.concat([write_IV.slice(0,4), nonce_explicit]);
-  var bob = crypto.createDecipheriv('aes-128-gcm', key, iv);
-  bob.setAuthTag(tag);
+  var nonce = (new Buffer(12)).fill(0x00);
+  var seq = Buffer.concat([(new Buffer(4)).fill(0x00), state.read.seq]);
+  for(var i = 0; i < nonce.length; i++) {
+    nonce[i] = write_IV[i] ^ seq[i];
+  }
   var aad = Buffer.concat([state.read.seq, record_header_buf]);
-  bob.setAAD(aad);
-  var clear = bob.update(enc_data);
-  bob.final();
+  var obj = ChaCha20Poly1305Decrypt(aad, key, nonce, enc_data);
+  var clear = obj.plaintext;
+  assert(obj.tag.equals(tag));
   return clear;
 };
 
@@ -148,24 +159,24 @@ TLSConnection.prototype.encrypt = function(buf) {
   var is_server = this.is_server;
   var record_header_type_version = buf.slice(0, 3);
   var record_header = buf.slice(0, 5);
-  incSeq(this.nonce_explicit);
-  var nonce_explicit = this.nonce_explicit;
   var clear_data = buf.slice(5);
 
   var key = is_server ? state.server_write_key : state.client_write_key;
   var write_IV = is_server ? state.server_write_IV : state.client_write_IV;
-  var iv = Buffer.concat([write_IV.slice(0,4), nonce_explicit]);
-  var bob = crypto.createCipheriv('aes-128-gcm', key, iv);
+
+  var nonce = (new Buffer(12)).fill(0x00);
+  var seq = Buffer.concat([(new Buffer(4)).fill(0x00), state.write.seq]);
+  for(var i = 0; i < nonce.length; i++) {
+    nonce[i] = write_IV[i] ^ seq[i];
+  }
   var aad = Buffer.concat([state.write.seq, record_header]);
-  bob.setAAD(aad);
-  var encrypted1 = bob.update(clear_data);
-  var encrypted2 = bob.final();
-  var encrypted = Buffer.concat([encrypted1, encrypted2]);
-  var tag = bob.getAuthTag(tag);
+  var obj = ChaCha20Poly1305Encrypt(aad, key, nonce, clear_data);
+  var encrypted = obj.ciphertext;
+  var tag = obj.tag;
   var record_header_length = new Buffer(2);
-  record_header_length.writeUInt16BE(nonce_explicit.length + encrypted.length + tag.length);
+  record_header_length.writeUInt16BE(encrypted.length + tag.length);
   var record_header_buf = Buffer.concat([record_header_type_version, record_header_length]);
-  var ret = Buffer.concat([record_header_buf, nonce_explicit, encrypted, tag]);
+  var ret = Buffer.concat([record_header_buf, encrypted, tag]);
   return ret;
 };
 
@@ -304,8 +315,7 @@ TLSConnection.prototype.sendServerHello = function() {
     cipher_suites: cipher_suite,
     compression_method: (new Buffer(1)).fill(0)
   };
-
-  if (cipher_suite.equals(ecdhe_cipher))
+  if (cipher_suite.equals(ecdhe_cipher) || cipher_suite.equals(chacha20_cipher))
     server_hello_opts.extensions = [ExtensionType.EcPointFormats];
 
   this.state.server_hello = server_hello_opts;
@@ -327,7 +337,7 @@ TLSConnection.prototype.sendServerCertificate = function() {
   var buf = frame.createCertificate(frame, true, server_certificate_opts);
   this.sendHandshake(buf, function() {
     debug('ServerCertificate sent');
-    if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
+    if (state.server_hello.cipher_suites.equals(ecdhe_cipher) || state.server_hello.cipher_suites.equals(chacha20_cipher)) {
       self.sendServerKeyExchange();
     } else {
       self.sendServerHelloDone();
@@ -491,7 +501,7 @@ TLSFrame.prototype.processClientKeyExchange = function(reader) {
   var preMasterSecret;
   var connection = this.connection;
   var state = connection.state;
-  if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
+  if (state.server_hello.cipher_suites.equals(ecdhe_cipher) || state.server_hello.cipher_suites.equals(chacha20_cipher)) {
     var len = (reader.readBytes(1)).readUInt8(0);
     state.clientPublicKey = reader.readBytes(len);
     preMasterSecret = state.ServerECDHE.computeSecret(state.clientPublicKey);
@@ -532,7 +542,7 @@ TLSFrame.prototype.processCertificate = function(reader, is_server) {
 TLSFrame.prototype.processServerKeyExchange = function(reader, is_server) {
   var connection = this.connection;
   var state = connection.state;
-  if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
+  if (state.server_hello.cipher_suites.equals(ecdhe_cipher) || state.server_hello.cipher_suites.equals(chacha20_cipher)) {
     var curve_type = reader.readBytes(1);
     assert(curve_type.readUInt8(0) === 03); // only named curve supported
     var named_curve = reader.readBytes(2);
@@ -681,7 +691,7 @@ TLSFrame.prototype.createClientKeyExchange = function(frame) {
   var state = connection.state;
   var type = HandshakeType.ClientKeyExchange;
 
-  if (state.server_hello.cipher_suites.equals(ecdhe_cipher)) {
+  if (state.server_hello.cipher_suites.equals(ecdhe_cipher) || state.server_hello.cipher_suites.equals(chacha20_cipher)) {
     var writer = new DataWriter(4);
     writer.writeBytes(type, 1);
     var curve_type = new Buffer('03', 'hex');    // named_curve
@@ -868,14 +878,14 @@ function GenerateMasterSecret(connection) {
   var master_secret = PRF12(algo, pre_master_secret, "master secret", seed, 48);
   connection.state.securityParameters.master_secret = master_secret;
   seed = Buffer.concat([ServerHello.random, ClientHello.random]);
-  var key_block = PRF12(algo, master_secret, "key expansion", seed, 40);
+  var key_block = PRF12(algo, master_secret, "key expansion", seed, 88);
   var key_block_reader = new DataReader(key_block);
   connection.state.client_write_MAC_key = null;
   connection.state.server_write_MAC_key = null;
-  connection.state.client_write_key = key_block_reader.readBytes(16);
-  connection.state.server_write_key = key_block_reader.readBytes(16);
-  connection.state.client_write_IV =  key_block_reader.readBytes(4);
-  connection.state.server_write_IV = key_block_reader.readBytes(4);
+  connection.state.client_write_key = key_block_reader.readBytes(32);
+  connection.state.server_write_key = key_block_reader.readBytes(32);
+  connection.state.client_write_IV =  key_block_reader.readBytes(12);
+  connection.state.server_write_IV = key_block_reader.readBytes(12);
 }
 
 function PRF12(algo, secret, label, seed, size) {

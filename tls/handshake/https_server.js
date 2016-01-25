@@ -6,9 +6,9 @@ var httpListener = http._connectionListener;
 var TLSConnection = require('./connection.js').TLSConnection;
 
 var opts = {
-  cert: fs.readFileSync('/home/ohtsu/tmp/cert/iijplus/iijplus.jp.cert'),
-  ca: fs.readFileSync('/home/ohtsu/tmp/cert/iijplus/iijplus.jp.ca'),
-  key: fs.readFileSync('/home/ohtsu/tmp/cert/iijplus//iijplus.jp.key')
+  cert: fs.readFileSync('/home/ohtsu/tmp/certs/iijplus/iijplus.jp.cert'),
+  ca: fs.readFileSync('/home/ohtsu/tmp/certs/iijplus/iijplus.jp.ca'),
+  key: fs.readFileSync('/home/ohtsu/tmp/certs/iijplus//iijplus.jp.key')
 };
 
 var port = 443;

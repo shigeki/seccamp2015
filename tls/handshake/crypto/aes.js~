@@ -1,0 +1,10 @@
+var assert = require('assert');
+
+
+
+function SubBytes(b) {
+  assert(Buffer.isBuffer(b));
+  assert(b.length === 1);
+
+
+}

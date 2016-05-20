@@ -1,0 +1,17 @@
+var assert = require('assert');
+var crypto = require('crypto');
+
+function Encipher(key, data) {
+  assert(Buffer.isBuffer(key));
+  assert(Buffer.isBuffer(data));
+  var iv = (new Buffer(128)).fill(0x00);
+  var cipher = crypto.CreateCipherIV('aes128', key, iv);
+
+}
+
+exports.Hash = Hash;
+function Hash(key, aad) {
+  var buf_zero = new Buffer(128);
+  buf_zero.fill(0x00);
+  var L_star = Encipher(key, buf_zero);
+}

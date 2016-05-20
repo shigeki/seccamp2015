@@ -144,9 +144,12 @@ TLSConnection.prototype.decrypt = function(frame, buf) {
   var write_IV = is_server ? state.client_write_IV: state.server_write_IV;
   var nonce = (new Buffer(12)).fill(0x00);
   var seq = Buffer.concat([(new Buffer(4)).fill(0x00), state.read.seq]);
+  console.log('seq', seq);
+  console.log('write_IV', write_IV);
   for(var i = 0; i < nonce.length; i++) {
     nonce[i] = write_IV[i] ^ seq[i];
   }
+  console.log('nonce', nonce);
   var aad = Buffer.concat([state.read.seq, record_header_buf]);
   var obj = ChaCha20Poly1305Decrypt(aad, key, nonce, enc_data);
   var clear = obj.plaintext;
